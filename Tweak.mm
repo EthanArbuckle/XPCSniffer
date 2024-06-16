@@ -33,6 +33,8 @@ static bool _xpcsniffer_message_dump(const char *key, xpc_object_t value, NSMuta
 static bool _xpcsniffer_dumper(xpc_object_t obj, NSMutableDictionary *logDictionary);
 static int _xpcsniffer_bplist_type(const char *bytes, size_t length);
 static NSString *_xpcsniffer_parse_bplist(const char *bytes, size_t length, int type);
+static CFMessagePortRef _xpcsniffer_get_remote_port(void);
+static void _xpcsniffer_send_message_to_remote(const char *message);
 
 #pragma mark - private
 
@@ -253,8 +255,48 @@ static bool _xpcsniffer_dumper(xpc_object_t obj, NSMutableDictionary *logDiction
     return true;
 }
 
+static void _xpcsniffer_send_message_to_remote(const char *message) {
+    
+    CFMessagePortRef remotePort = _xpcsniffer_get_remote_port();
+    if (remotePort == NULL) {
+        DLog(@"Failed to get remote port. Not sending anything");
+        return;
+    }
+
+    size_t msglen = strlen(message);
+    if (message == NULL || msglen == 0) {
+        DLog(@"Refusing to send an empty message");
+        return;
+    }
+
+    CFDataRef data = CFDataCreate(NULL, (const UInt8 *)message, msglen);
+    if (data == NULL) {
+        DLog(@"Failed to build message data. Not sending anything");
+        return;
+    }
+
+    SInt32 result = CFMessagePortSendRequest(remotePort, 0xdeadbeef, data, 1000, 0, NULL, NULL);
+    CFRelease(data);
+
+    if (result != kCFMessagePortSuccess) {
+        DLog(@"Failed to send message, error: %d", result);
+    }
+}
+
 static void _xpcsniffer_log_to_file(NSDictionary *dictionary) {
     dispatch_async(_xpcsniffer_queue, ^{
+        
+        NSError *error = nil;
+        NSData *jsonData = [NSJSONSerialization dataWithJSONObject:dictionary options:0 error:&error];
+        if (error || !jsonData) {
+            DLog(@"Error serializing JSON: %@", error);
+            return;
+        }
+
+        NSString *message = [[NSString alloc] initWithData:jsonData encoding:NSUTF8StringEncoding];
+        _xpcsniffer_send_message_to_remote([message UTF8String]);
+
+        /*
         NSString *cachesDirectory = [NSSearchPathForDirectoriesInDomains(NSCachesDirectory, NSUserDomainMask, YES) firstObject];
         NSString *logPath = [cachesDirectory stringByAppendingPathComponent:@"XPCSniffer.log"];
         NSLog(@"+[XPCSniffer] Writing to %@", logPath);
@@ -276,6 +318,7 @@ static void _xpcsniffer_log_to_file(NSDictionary *dictionary) {
             [handle writeData:[message dataUsingEncoding:NSUTF8StringEncoding]];
             [handle closeFile];
         }
+        */
     });
 }
 
@@ -356,11 +399,60 @@ __unused static xpc_object_t new_xpc_connection_send_message_with_reply_sync(xpc
     return orig_xpc_connection_send_message_with_reply_sync(connection, message);
 }
 
+static CFMessagePortRef _xpcsniffer_get_remote_port(void) {
+    static CFMessagePortRef remotePort = NULL;
+    if (remotePort == NULL) {
+        
+        FILE *fp = fopen("/tmp/xpcsniffer_message.port", "r");
+        if (fp == NULL) {
+            DLog(@"Failed to read port name from file");
+            return NULL;
+        }
+
+        char port_name[256];
+        if (fscanf(fp, "%255s", port_name) != 1) {
+            DLog(@"Failed to read port name from file\n");
+            fclose(fp);
+            return NULL;
+        }
+        fclose(fp);
+
+        CFStringRef cf_port_name = CFStringCreateWithCString(NULL, port_name, kCFStringEncodingUTF8);
+        if (cf_port_name == NULL) {
+            DLog(@"Failed to create CFString for port name");
+            return NULL;
+        }
+
+        remotePort = CFMessagePortCreateRemote(kCFAllocatorDefault, cf_port_name);
+        CFRelease(cf_port_name);
+        if (remotePort == NULL) {
+            DLog(@"Failed to create remote message port");
+            return NULL;
+        }
+
+        SInt32 result = CFMessagePortSendRequest(remotePort, 0xf00dface, NULL, 1000, 0, NULL, NULL);
+        if (result != kCFMessagePortSuccess) {
+            DLog(@"Failed to send a check-in message to the remote port, error: %d", result);
+            CFRelease(remotePort);
+            return NULL;
+        }
+
+        DLog(@"Created remote message port %p with name %s", remotePort, port_name);
+    }
+
+    return remotePort;
+}
+
 #pragma mark - ctor
 
 %ctor {
     @autoreleasepool {     
         DLog(@"~~ Hooking ~~");
+    
+        if (_xpcsniffer_get_remote_port() == NULL) {
+            DLog(@"Failed to setup the remote message port");
+            return;
+        }
 
         // CoreFoundation
         void *cf_handle = dlopen("/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation", RTLD_NOW);
