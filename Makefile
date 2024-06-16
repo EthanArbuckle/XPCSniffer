@@ -12,6 +12,3 @@ $(TWEAK_NAME)_CFLAGS += -DTHEOS_LEAN_AND_MEAN -Wno-shift-negative-value -Wno-int
 $(TWEAK_NAME)_FRAMEWORKS = CoreFoundation Foundation
 
 include $(THEOS_MAKE_PATH)/tweak.mk
-
-after-install::
-	install.exec "killall -9 SpringBoard"

@@ -20,21 +20,22 @@
 
 static dispatch_queue_t _xpcsniffer_queue = dispatch_queue_create("XPCSniffer",  DISPATCH_QUEUE_SERIAL);
 static CFPropertyListRef (*__CFBinaryPlistCreate15)(const uint8_t *, uint64_t) = nil;
+static CFTypeRef (*__CFXPCCreateCFObjectFromXPCObject)(xpc_object_t) = nil;
 
 #pragma mark - functions
 
 static uint64_t _xpcsniffer_real_signextend_64(uint64_t imm, uint8_t bit);
 static uintptr_t *_xpcsniffer_step64(uint32_t *base, size_t length, uint8_t step_count, uint32_t what, uint32_t mask);
-static NSString *_xpcsniffer_get_timestring();
-static NSMutableDictionary *_xpcsniffer_dictionary(xpc_connection_t connection);
+static NSString *_xpcsniffer_get_timestring(void);
+static NSMutableDictionary *_xpcsniffer_dictionary(xpc_connection_t connection, xpc_object_t xpc_message);
 static NSString *_xpcsniffer_connection_name(xpc_connection_t connection);
 static NSString *_xpcsniffer_proc_name(int pid);
-static bool _xpcsniffer_message_dump(const char *key, xpc_object_t value, NSMutableDictionary *logDictionary) ;
-static bool _xpcsniffer_dumper(xpc_object_t obj, NSMutableDictionary *logDictionary);
 static int _xpcsniffer_bplist_type(const char *bytes, size_t length);
-static NSString *_xpcsniffer_parse_bplist(const char *bytes, size_t length, int type);
+static id _xpcsniffer_parse_bplist(const char *bytes, size_t length, int type);
 static CFMessagePortRef _xpcsniffer_get_remote_port(void);
 static void _xpcsniffer_send_message_to_remote(const char *message);
+static NSDictionary *_xpcsniffer_json_safe_dictionary(NSDictionary *dict);
+static id _xpcsniffer_json_safe(id object);
 
 #pragma mark - private
 
@@ -73,7 +74,7 @@ static uintptr_t *_xpcsniffer_step64(uint32_t *base, size_t length, uint8_t step
     return NULL;
 }
 
-static NSString *_xpcsniffer_get_timestring() {
+static NSString *_xpcsniffer_get_timestring(void) {
     time_t now = time(NULL);
     char *timeString = ctime(&now);
     timeString[strlen(timeString) - 1] = '\0';
@@ -81,20 +82,78 @@ static NSString *_xpcsniffer_get_timestring() {
     return [NSString stringWithUTF8String:timeString];
 }
 
-static NSMutableDictionary *_xpcsniffer_dictionary(xpc_connection_t connection) {
+static NSMutableDictionary *_xpcsniffer_dictionary(xpc_connection_t connection, xpc_object_t xpc_message) {
     NSMutableDictionary *dictionary = [NSMutableDictionary dictionary];
-    dictionary[@"connection_address"] = [NSString stringWithFormat:@"%p", connection];
     dictionary[@"connection_time"] = _xpcsniffer_get_timestring();
-    dictionary[@"xpc_message"] = [NSMutableDictionary dictionary];
+
+    if (connection == NULL && xpc_message == NULL) {
+        return dictionary;
+    }
+
+    if (connection) {
+        dictionary[@"connection"] = _xpcsniffer_connection_name(connection);
+    }
+
+    if (xpc_message == NULL) {
+        return dictionary;
+    }
+
+    // Check if the object is bplist17-formatted. If it is, and there's an XPC connection,
+    // setup an NSXPCDecoder to decode the message
+    if (xpc_get_type(xpc_message) == XPC_TYPE_DICTIONARY) {
+        
+        xpc_object_t root = xpc_dictionary_get_value(xpc_message, "root");
+        if (root) {
+            @try {
+                Class _NSXPCDecoder = NSClassFromString(@"NSXPCDecoder");
+                id decoder = [[_NSXPCDecoder alloc] init];
+
+                if (connection) {
+                    // The xpc connection supplies details about classes that may be needed to decode the message
+                    [decoder performSelector:NSSelectorFromString(@"set_connection:") withObject:(__bridge id)connection];
+                }
+
+                [decoder performSelector:NSSelectorFromString(@"_startReadingFromXPCObject:") withObject:xpc_message];
+                id decodedPlist = [decoder debugDescription];
+
+                dictionary[@"xpc_message"] = decodedPlist;
+                return dictionary;
+            }
+            @catch (NSException *exception) {
+                DLog(@"Failed to decode rootb17 %@", exception);
+            }
+        }
+    }
+
+    // The object is not a bplist17 root (or at least not a valid one).
+    // See if CoreFoundation can decode it
+    id object = (__bridge id)__CFXPCCreateCFObjectFromXPCObject(xpc_message);
+    if (object) {
+        dictionary[@"xpc_message"] = object;
+    }
 
     return dictionary;
 }
 
 static NSString *_xpcsniffer_connection_name(xpc_connection_t connection) {
-    const char *name = xpc_connection_get_name(connection);
-    if (name) return @(name);
 
-    return @"?";
+    if (connection == NULL) {
+        return @"?";
+    }
+
+    const char *name = xpc_connection_get_name(connection);
+    if (name) {
+        return @(name);
+    }
+
+    // Try for the PID if there's no name
+    pid_t pid = xpc_connection_get_pid(connection);
+    if (pid > 0) {
+        return _xpcsniffer_proc_name(pid);
+    }
+
+    // Fallback to the pointer value
+    return [NSString stringWithFormat:@"%p", connection];
 }
 
 static NSString *_xpcsniffer_proc_name(int pid) {
@@ -115,64 +174,12 @@ static NSString *_xpcsniffer_hex_string(const char *bytes, size_t length) {
     return hexString;
 }
 
-static bool _xpcsniffer_message_dump(const char *key, xpc_object_t value, NSMutableDictionary *logDictionary) {
-    NSString *logKey = [NSString stringWithUTF8String:key];
-    xpc_type_t type = xpc_get_type(value);
-
-    if (type == XPC_TYPE_NULL)          logDictionary[logKey] = @"NULL";
-    else if (type == XPC_TYPE_ACTIVITY) logDictionary[logKey] = @"Activity";
-    else if (type == XPC_TYPE_DATE)     logDictionary[logKey] = @"Date";
-    else if (type == XPC_TYPE_SHMEM)    logDictionary[logKey] = @"Shared memory";
-    else if (type == XPC_TYPE_ENDPOINT) logDictionary[logKey] = @"XPC Endpoint";
-    else if (type == XPC_TYPE_BOOL)     logDictionary[logKey] = @(xpc_bool_get_value(value));
-    else if (type == XPC_TYPE_DOUBLE)   logDictionary[logKey] = @(xpc_double_get_value(value));
-    else if (type == XPC_TYPE_INT64)    logDictionary[logKey] = @(xpc_int64_get_value(value));
-    else if (type == XPC_TYPE_UINT64)   logDictionary[logKey] = @(xpc_uint64_get_value(value));
-    else if (type == XPC_TYPE_STRING)   logDictionary[logKey] = @(xpc_string_get_string_ptr(value));
-    else if (type == XPC_TYPE_UUID) { 
-        char buf[256];
-        uuid_unparse(xpc_uuid_get_bytes(value), buf);
-        logDictionary[logKey] = @(buf);
-    }
-    else if (type == XPC_TYPE_FD) {
-        char buf[4096];
-        int fd = xpc_fd_dup(value);
-        fcntl(fd, F_GETPATH, buf);
-
-        logDictionary[logKey] = @(buf);
-    }
-    else if (type == XPC_TYPE_DATA) {
-        size_t length = xpc_data_get_length(value);
-        const char *bytes = (const char *)xpc_data_get_bytes_ptr(value);
-
-        if (bytes) {
-            int plistType = _xpcsniffer_bplist_type(bytes, length);
-            if (plistType >= 0) {
-                logDictionary[logKey] = _xpcsniffer_parse_bplist(bytes, length, plistType);
-            }
-            else {
-                logDictionary[logKey] = _xpcsniffer_hex_string(bytes, length);
-            }
-        }
-    }
-    else if (type == XPC_TYPE_ARRAY) {
-        _xpcsniffer_dumper(value, logDictionary);
-    }
-    else if (type == XPC_TYPE_DICTIONARY) {
-        _xpcsniffer_dumper(value, logDictionary);
-    }
-    else {
-        logDictionary[logKey] = [NSString stringWithFormat:@"Unknown: %p", type]; 
-    }
-
-    return true;
-}
-
 static int _xpcsniffer_bplist_type(const char *bytes, size_t length) {
     int type = -1;
 
     if (bytes && length >= 8) {
-        if (memcmp(bytes, "bplist16", 8) == 0)      type = 16;
+        if (memcmp(bytes, "bplist17", 8) == 0)      type = -1; // todo
+        else if (memcmp(bytes, "bplist16", 8) == 0) type = 16;
         else if (memcmp(bytes, "bplist15", 8) == 0) type = 15;
         else if (memcmp(bytes, "bplist00", 8) == 0) type = 0;
     }
@@ -180,33 +187,24 @@ static int _xpcsniffer_bplist_type(const char *bytes, size_t length) {
     return type;
 }
 
-static NSString *_xpcsniffer_parse_bplist(const char *bytes, size_t length, int type) {
-    NSString *returnValue = nil;
+static id _xpcsniffer_parse_bplist(const char *bytes, size_t length, int type) {
+    id returnValue = nil;
 
     switch (type) {
         // bplist00
         case 0: {
             NSError *error = nil;    
             NSData *data = [NSData dataWithBytes:bytes length:length];
-            id plist = [NSPropertyListSerialization propertyListWithData:data options:0 format:nil error:&error];
-            if (!error && plist) returnValue = [plist description];
-
+            returnValue = [NSPropertyListSerialization propertyListWithData:data options:0 format:nil error:&error];
+            if (error || (returnValue == nil && data.length > 0)) {
+                DLog(@"Failed to parse bplist00: %@ %@", error, data);
+            }
             break;
         }   
         // bplist15
         case 15: {
             if (__CFBinaryPlistCreate15) {
-                CFPropertyListRef plist = __CFBinaryPlistCreate15((const uint8_t *)bytes, length);
-                if (plist) { 
-                    CFErrorRef dataError = nil;
-                    CFDataRef xmlData = CFPropertyListCreateData(kCFAllocatorDefault, plist, kCFPropertyListXMLFormat_v1_0, 0, &dataError);
-                    if (!dataError && xmlData) {
-                        NSData *data = (__bridge NSData *)xmlData;
-                        returnValue = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
-                        
-                        CFRelease(xmlData);
-                    }
-                }
+                returnValue = (__bridge id)__CFBinaryPlistCreate15((const uint8_t *)bytes, length);
             }
             else {
                 returnValue = _xpcsniffer_hex_string(bytes, length);
@@ -218,54 +216,25 @@ static NSString *_xpcsniffer_parse_bplist(const char *bytes, size_t length, int 
         case 16:
             returnValue = _xpcsniffer_hex_string(bytes, length);
             break;
+
+        default:
+            break;
     }
 
     return returnValue;
 }
 
-static bool _xpcsniffer_dumper(xpc_object_t obj, NSMutableDictionary *logDictionary) {
-    xpc_type_t type = xpc_get_type(obj);
-
-    if (type == XPC_TYPE_CONNECTION) {        
-        int pid = xpc_connection_get_pid(obj);
-        logDictionary[@"connection_name"] = _xpcsniffer_connection_name(obj);
-        logDictionary[@"process_id"] = @(pid);
-        logDictionary[@"process_name"] = _xpcsniffer_proc_name(pid);
-    }
-    else if (type == XPC_TYPE_ARRAY) {
-        size_t count = xpc_array_get_count(obj);
-        if (count > 0) {
-            xpc_array_apply(obj, ^(size_t index, xpc_object_t value) {
-                NSString *key = [NSString stringWithFormat:@"array_level_%lu", index];
-                logDictionary[key] = [NSMutableDictionary dictionary];
-
-                return _xpcsniffer_dumper(value, logDictionary[key]);
-            });
-        }
-    }
-    else if (type == XPC_TYPE_DICTIONARY) {
-        size_t count = xpc_dictionary_get_count(obj);
-        if (count > 0) {
-            xpc_dictionary_apply(obj, ^(const char *key, xpc_object_t value) {
-                return _xpcsniffer_message_dump(key, value, logDictionary);
-            });
-        }
-    }
-
-    return true;
-}
-
 static void _xpcsniffer_send_message_to_remote(const char *message) {
-    
-    CFMessagePortRef remotePort = _xpcsniffer_get_remote_port();
-    if (remotePort == NULL) {
-        DLog(@"Failed to get remote port. Not sending anything");
+
+    size_t msglen = 0;
+    if (message == NULL || (msglen = strlen(message)) == 0) {
+        DLog(@"Refusing to send an empty message");
         return;
     }
 
-    size_t msglen = strlen(message);
-    if (message == NULL || msglen == 0) {
-        DLog(@"Refusing to send an empty message");
+    CFMessagePortRef remotePort = _xpcsniffer_get_remote_port();
+    if (remotePort == NULL) {
+        DLog(@"Failed to get remote port. Not sending anything");
         return;
     }
 
@@ -275,19 +244,105 @@ static void _xpcsniffer_send_message_to_remote(const char *message) {
         return;
     }
 
-    SInt32 result = CFMessagePortSendRequest(remotePort, 0xdeadbeef, data, 1000, 0, NULL, NULL);
+    SInt32 result = -1;
+    int attempts = 0;
+    while (attempts < 3) {
+
+        result = CFMessagePortSendRequest(remotePort, 0xdeadbeef, data, 0, 0, NULL, NULL);
+        if (result == kCFMessagePortSendTimeout || result == kCFMessagePortReceiveTimeout) {
+            usleep(1000000);
+            attempts++;
+        }
+        
+        break;
+    }
     CFRelease(data);
 
     if (result != kCFMessagePortSuccess) {
-        DLog(@"Failed to send message, error: %d", result);
+        DLog(@"Failed to send message after multiple attempts. Error: %d", result);
     }
 }
 
+id _xpcsniffer_json_safe(id object) {
+    
+    if (!object) {
+        return @"NULL";
+    }
+
+    if ([object isKindOfClass:[NSDictionary class]]) {
+        return _xpcsniffer_json_safe_dictionary(object);
+    }
+    else if ([object isKindOfClass:[NSArray class]]) {
+
+        NSMutableArray *sanitizedArray = [NSMutableArray array];
+        for (id item in object) {
+            [sanitizedArray addObject:_xpcsniffer_json_safe(item)];
+        }
+
+        return sanitizedArray;
+    }
+    else if ([object isKindOfClass:[NSData class]]) {
+
+        NSData *data = object;
+        const char *bytes = (const char *)data.bytes;
+        if (data.length == 0 || bytes == NULL) {
+            return @"<empty>";
+        }
+        
+        int type = _xpcsniffer_bplist_type(bytes, (size_t)data.length);
+        if (type >= 0) {
+            id plist = _xpcsniffer_parse_bplist(bytes, (size_t)data.length, type);
+            return _xpcsniffer_json_safe(plist);
+        }
+
+        @try {
+            CFPropertyListRef plist = __CFBinaryPlistCreate15((const uint8_t *)bytes, data.length);
+            if (plist) {
+                return _xpcsniffer_json_safe((__bridge id)plist);
+            }
+        }
+        @catch (NSException *exception) {
+            DLog(@"Exception when trying to decode bplist: %@", exception);
+        }
+
+        return [object base64EncodedStringWithOptions:0];
+    }
+    else if ([object isKindOfClass:NSClassFromString(@"__NSCFType")]) {
+        return [object description];
+    }
+    else if ([object isKindOfClass:[NSDate class]] || [object isKindOfClass:NSClassFromString(@"__NSTaggedDate")]) {
+        return [object description];
+    }
+
+    return object;
+}
+
+NSDictionary *_xpcsniffer_json_safe_dictionary(NSDictionary *inputDictionary) {
+    NSMutableDictionary *sanitizedDictionary = [NSMutableDictionary dictionary];
+    
+    for (NSString *key in inputDictionary) {
+        id value = inputDictionary[key];
+        sanitizedDictionary[key] = _xpcsniffer_json_safe(value);
+    }
+
+    return sanitizedDictionary;
+}
+
 static void _xpcsniffer_log_to_file(NSDictionary *dictionary) {
+
+    if (!dictionary || [dictionary valueForKey:@"xpc_message"] == nil) {
+        return;
+    }
+
+    NSDictionary *jsonSafeDictionary = _xpcsniffer_json_safe_dictionary(dictionary);
+    if (!jsonSafeDictionary) {
+        return;
+    }
+
     dispatch_async(_xpcsniffer_queue, ^{
         
         NSError *error = nil;
-        NSData *jsonData = [NSJSONSerialization dataWithJSONObject:dictionary options:0 error:&error];
+        NSData *jsonData = [NSJSONSerialization dataWithJSONObject:jsonSafeDictionary options:0 error:&error];
         if (error || !jsonData) {
             DLog(@"Error serializing JSON: %@", error);
             return;
@@ -295,30 +350,6 @@ static void _xpcsniffer_log_to_file(NSDictionary *dictionary) {
 
         NSString *message = [[NSString alloc] initWithData:jsonData encoding:NSUTF8StringEncoding];
         _xpcsniffer_send_message_to_remote([message UTF8String]);
-
-        /*
-        NSString *cachesDirectory = [NSSearchPathForDirectoriesInDomains(NSCachesDirectory, NSUserDomainMask, YES) firstObject];
-        NSString *logPath = [cachesDirectory stringByAppendingPathComponent:@"XPCSniffer.log"];
-        NSLog(@"+[XPCSniffer] Writing to %@", logPath);
-
-        if (![NSFileManager.defaultManager fileExistsAtPath:logPath]) {
-            [NSData.data writeToFile:logPath atomically:YES];
-        } 
-
-        // Make message
-        NSError *error = nil;
-        NSData *jsonData = [NSJSONSerialization dataWithJSONObject:dictionary options:0 error:&error];
-        if (!error && jsonData) {
-            NSString *message = [[NSString alloc] initWithData:jsonData encoding:NSUTF8StringEncoding];
-            message = [message stringByAppendingString:@"\n"];
-            
-            // Append message
-            NSFileHandle *handle = [NSFileHandle fileHandleForWritingAtPath:logPath];
-            [handle truncateFileAtOffset:handle.seekToEndOfFile];
-            [handle writeData:[message dataUsingEncoding:NSUTF8StringEncoding]];
-            [handle closeFile];
-        }
-        */
     });
 }
 
@@ -327,28 +358,28 @@ static void _xpcsniffer_log_to_file(NSDictionary *dictionary) {
 // xpc_connection_t xpc_connection_create(const char *name, dispatch_queue_t targetq);
 __unused static xpc_connection_t (*orig_xpc_connection_create)(const char *name, dispatch_queue_t targetq);
 __unused static xpc_connection_t new_xpc_connection_create(const char *name, dispatch_queue_t targetq) {
-    DLog(@"xpc_connection_create(\"%s\", targetq=%p);", name, targetq);
 
     xpc_connection_t returned = orig_xpc_connection_create(name, targetq);
-    DLog(@"orig_xpc_connection_create(%p)", returned);
-
     return returned;
 }
 
 #pragma mark - xpc_pipe_routine
 
-// int xpc_pipe_routine(xpc_object_t xpcPipe, xpc_object_t *in, xpc_object_t *out);
-__unused static int (*orig_xpc_pipe_routine)(xpc_object_t xpcPipe, xpc_object_t *in, xpc_object_t *out);
-__unused static int new_xpc_pipe_routine (xpc_object_t xpcPipe, xpc_object_t *in, xpc_object_t *out) {
+// int xpc_pipe_routine(xpc_object_t pipe, xpc_object_t request, xpc_object_t *reply);
+__unused static int (*orig_xpc_pipe_routine)(xpc_object_t pipe, xpc_object_t request, xpc_object_t *reply);
+__unused static int new_xpc_pipe_routine (xpc_object_t pipe, xpc_object_t request, xpc_object_t *reply) {
     // Call orig
-    int returnValue = orig_xpc_pipe_routine(xpcPipe, in, out);
+    int returnValue = orig_xpc_pipe_routine(pipe, request, reply);
 
     // Log
-    xpc_object_t message = *out;
-    NSMutableDictionary *logDictionary = _xpcsniffer_dictionary(message);
-    logDictionary[@"pipe_desc"] = @(xpc_copy_description(xpcPipe));
-    _xpcsniffer_dumper(message, logDictionary[@"xpc_message"]);
-    DLog(@"XPC_PRO %@", logDictionary);
+    NSMutableDictionary *logDictionary = _xpcsniffer_dictionary(pipe, request);
+    logDictionary[@"pipe_desc"] = @(xpc_copy_description(pipe));
+
+    if (*reply && __CFXPCCreateCFObjectFromXPCObject) {
+        CFTypeRef replyObject = __CFXPCCreateCFObjectFromXPCObject(*reply);
+        id sanitizedReply = _xpcsniffer_json_safe((__bridge id)replyObject);
+        logDictionary[@"reply"] = sanitizedReply;
+    }
 
     return returnValue;
 }
@@ -358,12 +389,8 @@ __unused static int new_xpc_pipe_routine (xpc_object_t xpcPipe, xpc_object_t *in
 // void xpc_connection_send_message(xpc_connection_t connection, xpc_object_t message);
 __unused static void (*orig_xpc_connection_send_message)(xpc_connection_t connection, xpc_object_t message);
 __unused static void new_xpc_connection_send_message(xpc_connection_t connection, xpc_object_t message) {
-    NSMutableDictionary *logDictionary = _xpcsniffer_dictionary(connection);
+    NSMutableDictionary *logDictionary = _xpcsniffer_dictionary(connection, message);
 
-    _xpcsniffer_dumper(connection, logDictionary);
-    _xpcsniffer_dumper(message, logDictionary[@"xpc_message"]);
-
-    DLog(@"XPC_CSM %@", logDictionary);
     _xpcsniffer_log_to_file(logDictionary);
 
     orig_xpc_connection_send_message(connection, message);
@@ -374,11 +401,8 @@ __unused static void new_xpc_connection_send_message(xpc_connection_t connection
 // void xpc_connection_send_message_with_reply(xpc_connection_t connection, xpc_object_t message, dispatch_queue_t replyq, xpc_handler_t handler);
 __unused static void (*orig_xpc_connection_send_message_with_reply)(xpc_connection_t connection, xpc_object_t message, dispatch_queue_t replyq, xpc_handler_t handler);
 __unused static void new_xpc_connection_send_message_with_reply(xpc_connection_t connection, xpc_object_t message, dispatch_queue_t replyq, xpc_handler_t handler) {
-    NSMutableDictionary *logDictionary = _xpcsniffer_dictionary(connection);
-
-    _xpcsniffer_dumper(connection, logDictionary);
-    _xpcsniffer_dumper(message, logDictionary[@"xpc_message"]);
-    DLog(@"XPC_CSMR %@", logDictionary);
+    NSMutableDictionary *logDictionary = _xpcsniffer_dictionary(connection, message);
+    logDictionary[@"reply_queue"] = [NSString stringWithFormat:@"%p", replyq];
     _xpcsniffer_log_to_file(logDictionary);
 
     orig_xpc_connection_send_message_with_reply(connection, message, replyq, handler);
@@ -389,11 +413,8 @@ __unused static void new_xpc_connection_send_message_with_reply(xpc_connection_t
 // xpc_object_t xpc_connection_send_message_with_reply_sync(xpc_connection_t connection, xpc_object_t message);
 __unused static xpc_object_t (*orig_xpc_connection_send_message_with_reply_sync)(xpc_connection_t connection, xpc_object_t message);
 __unused static xpc_object_t new_xpc_connection_send_message_with_reply_sync(xpc_connection_t connection, xpc_object_t message) {
-    NSMutableDictionary *logDictionary = _xpcsniffer_dictionary(connection);
-
-    _xpcsniffer_dumper(connection, logDictionary);
-    _xpcsniffer_dumper(message, logDictionary[@"xpc_message"]);
-    DLog(@"XPC_CSMRS %@", logDictionary);
+    NSMutableDictionary *logDictionary = _xpcsniffer_dictionary(connection, message);
+    
     _xpcsniffer_log_to_file(logDictionary);
 
     return orig_xpc_connection_send_message_with_reply_sync(connection, message);
@@ -430,7 +451,7 @@ static CFMessagePortRef _xpcsniffer_get_remote_port(void) {
             return NULL;
         }
 
-        SInt32 result = CFMessagePortSendRequest(remotePort, 0xf00dface, NULL, 1000, 0, NULL, NULL);
+        SInt32 result = CFMessagePortSendRequest(remotePort, 0xf00dface, NULL, 0, 0, NULL, NULL);
         if (result != kCFMessagePortSuccess) {
             DLog(@"Failed to send a check-in message to the remote port, error: %d", result);
             CFRelease(remotePort);
@@ -465,6 +486,10 @@ static CFMessagePortRef _xpcsniffer_get_remote_port(void) {
         // __CFBinaryPlistCreate15
         __CFBinaryPlistCreate15 = (CFPropertyListRef(*)(const uint8_t *, uint64_t))_xpcsniffer_step64(_CFXPCCreateCFObjectFromXPCMessage, 64, 2, INSN_CALL);
         DLog(@"__CFBinaryPlistCreate15 %p", __CFBinaryPlistCreate15);
+
+        // _CFXPCCreateCFObjectFromXPCObject
+        __CFXPCCreateCFObjectFromXPCObject = (CFTypeRef (*)(xpc_object_t))dlsym(RTLD_DEFAULT, "_CFXPCCreateCFObjectFromXPCObject");
+        DLog(@"__CFXPCCreateCFObjectFromXPCObject %p", __CFXPCCreateCFObjectFromXPCObject);
 
         // libxpc
         void *libxpc_handle = dlopen("/usr/lib/system/libxpc.dylib", RTLD_NOW);
